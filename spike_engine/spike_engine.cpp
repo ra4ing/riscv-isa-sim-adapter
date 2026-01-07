@@ -387,24 +387,24 @@ size_t SpikeEngine::execute_sequence(
         return 0;
     }
 
-    // Calculate total size needed
+    // Calculate target PC (address after the last instruction)
     size_t total_size = std::accumulate(sizes.begin(), sizes.end(), size_t(0));
+    uint64_t target_pc = next_instruction_addr_ + total_size;
 
     // Check if we have enough space
-    if (next_instruction_addr_ + total_size > instruction_region_end_) {
+    if (target_pc > instruction_region_end_) {
         throw std::runtime_error("Out of instruction region space");
     }
 
     // Verify PC matches next instruction address
-    uint64_t current_pc = get_pc();
-    if (current_pc != next_instruction_addr_) {
+    if (get_pc() != next_instruction_addr_) {
         std::ostringstream oss;
         oss << "PC mismatch: expected 0x" << std::hex << next_instruction_addr_
-            << " but got 0x" << current_pc << std::dec;
+            << " but got 0x" << get_pc() << std::dec;
         throw std::runtime_error(oss.str());
     }
 
-    // Step 1: Write all instructions to memory
+    // Write all instructions to memory
     uint64_t write_addr = next_instruction_addr_;
     for (size_t i = 0; i < machine_codes.size(); ++i) {
         if (!write_memory(write_addr, machine_codes[i], sizes[i])) {
@@ -413,38 +413,44 @@ size_t SpikeEngine::execute_sequence(
         write_addr += sizes[i];
     }
 
-    // end_pc is the address right after the last instruction
-    uint64_t end_pc = write_addr;
-
-    // Step 2: Execute instructions until PC reaches or exceeds end_pc
-    // This correctly handles:
-    // - Single instruction: PC advances to end_pc after one step
-    // - Forward jumps: PC may jump past intermediate instructions
-    // - Backward loops: PC jumps back, continues until branch falls through
-    size_t executed = 0;
-
-    while (get_pc() < end_pc && executed < max_steps) {
-        if (!step_until_in_region()) {
-            std::ostringstream oss;
-            oss << "Failed to execute instruction (step=" << executed
-                << ", PC=0x" << std::hex << get_pc() << "): " << last_error_;
-            throw std::runtime_error(oss.str());
+    // Execute until PC reaches target address
+    // This handles all cases uniformly:
+    // - Sequential execution: PC advances to target_pc after each step
+    // - Trap handling: Spike handles traps internally, mret returns to next instruction
+    // - Forward jumps: PC jumps directly to target
+    // - Backward loops: PC loops until branch falls through to target_pc
+    size_t steps = 0;
+    while (get_pc() != target_pc && steps < max_steps) {
+        try {
+            proc_->step(1);
+        } catch (wait_for_interrupt_t&) {
+            // WFI instruction - PC already updated, continue execution
         }
-        executed++;
-        current_instr_index_++;
+        steps++;
     }
 
-    if (executed >= max_steps) {
+    if (steps >= max_steps) {
         std::ostringstream oss;
         oss << "Execution exceeded max_steps (" << max_steps << "), PC=0x"
-            << std::hex << get_pc() << ", end_pc=0x" << end_pc;
+            << std::hex << get_pc() << ", target_pc=0x" << target_pc;
         throw std::runtime_error(oss.str());
     }
 
-    // Update next instruction address to current PC
-    next_instruction_addr_ = get_pc();
+    // Update state
+    next_instruction_addr_ = target_pc;
+    current_instr_index_ += machine_codes.size();
 
-    return executed;
+    // Record trap information (inferred from extra steps)
+    size_t expected_steps = machine_codes.size();
+    if (steps > expected_steps) {
+        last_execution_trapped_ = true;
+        last_trap_handler_steps_ = steps - expected_steps;
+    } else {
+        last_execution_trapped_ = false;
+        last_trap_handler_steps_ = 0;
+    }
+
+    return machine_codes.size();
 }
 
 uint64_t SpikeEngine::get_xpr(int reg_index) const {
@@ -613,13 +619,6 @@ uint32_t SpikeEngine::read_memory(uint64_t addr) {
     }
 }
 
-bool SpikeEngine::is_in_instruction_region(uint64_t pc) const {
-    // Use <= to include instruction_region_end_ as a valid "returned" position.
-    // This handles the case where the last instruction causes a trap and the
-    // trap handler returns to MEPC+4 = instruction_region_end_.
-    return pc >= instruction_region_start_ && pc <= instruction_region_end_;
-}
-
 bool SpikeEngine::step_processor() {
     try {
         // Execute one instruction
@@ -678,148 +677,6 @@ bool SpikeEngine::step_processor() {
         last_error_ = oss.str();
         return false;
     }
-}
-
-bool SpikeEngine::step_until_in_region() {
-    // Reset trap detection state
-    last_execution_trapped_ = false;
-    last_trap_handler_steps_ = 0;
-
-    // Maximum steps to allow for trap handler execution
-    // Trap handlers are typically short (< 20 instructions), but we allow
-    // more steps for safety (e.g., nested handlers, complex dispatch)
-    const size_t MAX_TRAP_HANDLER_STEPS = 1000;
-    size_t trap_steps = 0;
-
-    // Step 1: Execute the target instruction
-    try {
-        proc_->step(1);
-    } catch (wait_for_interrupt_t&) {
-        // WFI instruction - the processor is waiting for an interrupt.
-        // In fuzzing context, we treat this as a successful instruction execution.
-        // The PC has already been updated by set_pc_and_serialize() in the wfi() macro.
-        // We simply return success and continue execution.
-        return true;
-    } catch (triggers::matched_t& t) {
-        std::ostringstream oss;
-        oss << "Trigger matched (triggers::matched_t) during step: address=0x" << std::hex << t.address << std::dec;
-        last_error_ = oss.str();
-        return false;
-    } catch (trap_t& t) {
-        // Note: Spike normally handles traps internally via take_trap() in execute.cc
-        // and does NOT throw here. This catch is a fallback for unusual situations.
-        std::ostringstream oss;
-        oss << "Unexpected trap exception: " << t.name()
-            << " (cause=" << t.cause() << ")";
-        if (t.has_tval()) {
-            oss << ", tval=0x" << std::hex << t.get_tval() << std::dec;
-        }
-        last_error_ = oss.str();
-        return false;
-    } catch (trap_debug_mode&) {
-        last_error_ = "Processor entered debug mode";
-        return false;
-    } catch (const std::exception& e) {
-        last_error_ = std::string("Initial step failed: ") + e.what();
-        return false;
-    } catch (...) {
-        // Try to get more exception info
-        std::exception_ptr eptr = std::current_exception();
-        std::ostringstream oss;
-        oss << "Initial step failed: Unknown exception";
-        if (eptr) {
-            try {
-                std::rethrow_exception(eptr);
-            } catch (const std::exception& e) {
-                oss << " (std::exception: " << e.what() << ")";
-            } catch (const char* msg) {
-                oss << " (C-string: " << msg << ")";
-            } catch (...) {
-                // Advanced: try to get the real type name
-                std::type_info* t = abi::__cxa_current_exception_type();
-                if (t) {
-                    int status;
-                    char* demangled = abi::__cxa_demangle(t->name(), 0, 0, &status);
-                    oss << " (Type: " << (demangled ? demangled : t->name()) << ")";
-                    if (demangled) free(demangled);
-                } else {
-                    oss << " (truly unknown type)";
-                }
-            }
-        }
-        last_error_ = oss.str();
-        return false;
-    }
-
-    // Step 2: Check if PC is in instruction region
-    // If not, we're likely in a trap handler and need to continue executing
-    uint64_t current_pc = get_pc();
-
-    while (!is_in_instruction_region(current_pc) && trap_steps < MAX_TRAP_HANDLER_STEPS) {
-        try {
-            proc_->step(1);
-        } catch (wait_for_interrupt_t&) {
-            // WFI in trap handler - treat as successful step and continue
-            current_pc = get_pc();
-            trap_steps++;
-            continue;
-        } catch (trap_t& t) {
-            std::ostringstream oss;
-            oss << "Trap in handler: " << t.name()
-                << " (cause=" << t.cause() << ")";
-            last_error_ = oss.str();
-            return false;
-        } catch (trap_debug_mode&) {
-            last_error_ = "Debug mode in trap handler";
-            return false;
-        } catch (const std::exception& e) {
-            last_error_ = std::string("Exception in trap handler: ") + e.what();
-            return false;
-        } catch (...) {
-            // Try to get more exception info
-            std::exception_ptr eptr = std::current_exception();
-            std::ostringstream oss;
-            oss << "Unknown exception in trap handler";
-            if (eptr) {
-                try {
-                    std::rethrow_exception(eptr);
-                } catch (const std::exception& e) {
-                    oss << " (std::exception: " << e.what() << ")";
-                } catch (const char* msg) {
-                    oss << " (C-string: " << msg << ")";
-                } catch (...) {
-                    oss << " (truly unknown type)";
-                }
-            }
-            last_error_ = oss.str();
-            return false;
-        }
-
-        current_pc = get_pc();
-        trap_steps++;
-    }
-
-    // Step 3: Check if we exited the loop successfully
-    if (trap_steps >= MAX_TRAP_HANDLER_STEPS) {
-        std::ostringstream oss;
-        oss << "Trap handler did not return within " << MAX_TRAP_HANDLER_STEPS
-            << " steps. Last PC: 0x" << std::hex << current_pc << std::dec;
-        last_error_ = oss.str();
-        return false;
-    }
-
-    // Success: PC is back in instruction region
-    // Record trap information for logging
-    if (trap_steps > 0) {
-        last_execution_trapped_ = true;
-        last_trap_handler_steps_ = trap_steps;
-        if (verbose_) {
-            std::cout << "[SpikeEngine] Trap handler completed in " << trap_steps
-                      << " steps, PC now at 0x" << std::hex << current_pc << std::dec << std::endl;
-        }
-    }
-
-    return true;
 }
 
 void SpikeEngine::save_state(Checkpoint& checkpoint) {

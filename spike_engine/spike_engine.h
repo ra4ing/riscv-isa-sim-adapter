@@ -177,26 +177,27 @@ public:
      *
      * Execution logic:
      * 1. Write all instructions to memory starting at next_instruction_addr_
-     * 2. Calculate end_addr = next_instruction_addr_ + sum(sizes)
-     * 3. Execute until PC >= end_addr (handles jumps and loops automatically)
-     * 4. Each step uses step_until_in_region() to handle traps
-     * 5. Update next_instruction_addr_ to current PC
+     * 2. Calculate target_pc = next_instruction_addr_ + sum(sizes)
+     * 3. Execute until PC == target_pc
+     * 4. Update next_instruction_addr_ to target_pc
      *
-     * For loops (backward branches):
-     * - When branch jumps back, PC < end_addr, so execution continues
-     * - When branch falls through, PC >= end_addr, loop exits
+     * All cases are handled uniformly:
+     * - Sequential: PC advances to target_pc after each step
+     * - Trap: Spike handles internally, mret returns to next instruction
+     * - Forward jump: PC jumps directly to target
+     * - Backward loop: PC loops until branch falls through
      *
      * @param machine_codes List of machine codes to execute
      * @param sizes List of instruction sizes (2 or 4 bytes each)
      * @param max_steps Maximum execution steps (safety limit, default: 10000)
-     * @return Number of steps executed
+     * @return Number of instructions in the sequence
      *
      * @throws std::runtime_error if:
      *   - Engine not initialized
      *   - Out of instruction region space
      *   - PC mismatch (internal consistency error)
      *   - Memory write failure
-     *   - Execution failure or max_steps exceeded
+     *   - max_steps exceeded before reaching target_pc
      */
     size_t execute_sequence(
         const std::vector<uint32_t>& machine_codes,
@@ -393,32 +394,10 @@ private:
     uint32_t read_memory(uint64_t addr);
 
     /**
-     * Check if PC is within the instruction region
-     * @param pc Program counter value to check
-     * @return true if PC is within [instruction_region_start_, instruction_region_end_]
-     */
-    bool is_in_instruction_region(uint64_t pc) const;
-
-    /**
-     * Single step execution
+     * Single step execution (used during initialization)
      * Executes one instruction on processor
      */
     bool step_processor();
-
-    /**
-     * Step execution with trap handling
-     *
-     * Executes one instruction and continues stepping if the PC ends up
-     * outside the instruction region (e.g., in a trap handler). This ensures
-     * that trap handlers are fully executed before returning control.
-     *
-     * @return true if execution completed successfully with PC back in instruction region
-     * @return false if:
-     *   - Initial step failed
-     *   - Trap handler execution exceeded MAX_STEPS limit
-     *   - Exception occurred during trap handler execution
-     */
-    bool step_until_in_region();
 
     /**
      * Save processor state to checkpoint
