@@ -10,81 +10,15 @@
 #include <cstdint>
 #include <map>
 
+#include "state_query.h"
+#include "checkpoint.h"
+
 // Forward declarations
 class sim_t;
 class processor_t;
 class cfg_t;
 
 namespace spike_engine {
-
-/**
- * Checkpoint state for processor
- *
- * Represents a lightweight snapshot of processor state at a specific point.
- * Designed for efficient rollback during instruction validation (e.g., when
- * XOR value collisions occur and we need to retry with different instructions).
- *
- * Design Philosophy:
- *   - Minimal footprint: Only stores essential state (registers, PC, index)
- *   - Fast restore: Uses vector truncation instead of memory writes
- *   - Single checkpoint: Optimized for the common pattern of one active checkpoint
- *
- * Memory Consistency:
- *   After restore, memory may contain instructions that were executed after
- *   the checkpoint, but this is safe because:
- *   1. PC and next_instruction_addr point to the checkpoint position
- *   2. Subsequent execute_sequence() calls will overwrite old instructions
- *   3. Instructions past the checkpoint position will never be executed
- */
-struct Checkpoint {
-    // General purpose registers (x0-x31)
-    std::vector<uint64_t> xpr;
-
-    // Floating point registers (f0-f31)
-    // freg_t has two 64-bit fields: v[0] and v[1]
-    // Both must be saved/restored for correct NaN-boxing behavior
-    std::vector<uint64_t> fpr;      // FPR[i].v[0] - main 64-bit value
-    std::vector<uint64_t> fpr_v1;   // FPR[i].v[1] - extended/internal state
-
-    // Program counter
-    uint64_t pc;
-
-    // Index into instruction sequence
-    // Marks how many instructions have been executed at checkpoint time
-    size_t instr_index;
-
-    // Next available memory address for instruction placement
-    uint64_t next_instruction_addr;
-
-    // Memory region backup for checkpoint/restore
-    // This is essential for correct rollback when instructions modify memory
-    // (e.g., AMO instructions, store instructions)
-    std::vector<uint8_t> mem_region_backup;
-
-    // ========== Privilege and Mode State ==========
-    // Privilege level (0=U, 1=S, 3=M)
-    // Essential for correct trap handling after restore
-    uint64_t prv;
-
-    // Virtualization mode (for H extension)
-    bool v;
-
-    // Debug mode flag
-    bool debug_mode;
-
-    // ========== All CSRs ==========
-    // Complete CSR state captured as address->value map
-    // This ensures ALL CSRs are properly restored, including:
-    // - Trap handling CSRs (mtvec, mepc, mcause, mtval, etc.)
-    // - Status registers (mstatus, sstatus, etc.)
-    // - Interrupt/exception delegation registers
-    // - PMP configuration
-    // - Floating-point CSRs (fflags, frm, fcsr)
-    // - Custom CSRs
-    std::map<uint64_t, uint64_t> csr_values;
-
-    Checkpoint();
-};
 
 /**
  * SpikeEngine: Efficient Spike execution engine with checkpointing
@@ -105,9 +39,9 @@ struct Checkpoint {
  *   2. Engine executes template initialization code until reaching main()
  *   3. For each instruction to test:
  *      a. set_checkpoint() - save current processor state
- *      b. Read source register values (Python: get_xpr/get_fpr)
+ *      b. Read source register values via StateQuery
  *      c. execute_sequence() - write and execute instruction(s)
- *      d. Read destination register values (Python: get_xpr/get_fpr)
+ *      d. Read destination register values via StateQuery
  *      e. Python computes XOR and checks uniqueness
  *      f. If collision: restore_checkpoint() and retry
  *         If unique: proceed to next instruction
@@ -120,15 +54,30 @@ struct Checkpoint {
  * Thread Safety:
  *   Not thread-safe. Each thread should use its own SpikeEngine instance.
  *
- * Example:
+ * Architecture:
+ *   - SpikeEngine: Execution control (initialize, checkpoint, execute)
+ *   - StateQuery: All processor state queries (registers, CSRs, memory, etc.)
+ *   - CheckpointManager: Checkpoint save/restore operations
+ *
+ * Example (C++):
  *   SpikeEngine engine("template.elf", "rv64gc", 1000);
  *   engine.initialize();
+ *   auto* sq = engine.get_state_query();
  *
  *   engine.set_checkpoint();
- *   uint64_t src_val = engine.get_xpr(2);  // Read x2 before
+ *   uint64_t src_val = sq->get_xpr(2);  // Read x2 before
  *   engine.execute_sequence({0x003100b3}, {4});  // add x1, x2, x3
- *   uint64_t dst_val = engine.get_xpr(1);  // Read x1 after
- *   // Python: compute XOR, check uniqueness, etc.
+ *   uint64_t dst_val = sq->get_xpr(1);  // Read x1 after
+ *
+ * Example (Python):
+ *   engine = SpikeEngine("template.elf", "rv64gc", 1000)
+ *   engine.initialize()
+ *   sq = engine.get_state_query()
+ *
+ *   engine.set_checkpoint()
+ *   src_val = sq.get_xpr(2)
+ *   engine.execute_sequence([0x003100b3], [4])
+ *   dst_val = sq.get_xpr(1)
  */
 class SpikeEngine {
 public:
@@ -204,50 +153,9 @@ public:
         const std::vector<size_t>& sizes,
         size_t max_steps = 10000);
 
-    /**
-     * Get value of a general-purpose register
-     * @param reg_index Register index (0-31)
-     * @return Register value
-     */
-    uint64_t get_xpr(int reg_index) const;
-
-    /**
-     * Get value of a floating-point register
-     * @param reg_index Register index (0-31)
-     * @return Register value (as uint64_t)
-     */
-    uint64_t get_fpr(int reg_index) const;
-
-    /**
-     * Get program counter value
-     * @return PC value
-     */
-    uint64_t get_pc() const;
-
-    /**
-     * Get all general-purpose register values
-     * @return Vector of 32 register values (x0-x31)
-     */
-    std::vector<uint64_t> get_all_xpr() const;
-
-    /**
-     * Get all floating-point register values
-     * @return Vector of 32 register values (f0-f31)
-     */
-    std::vector<uint64_t> get_all_fpr() const;
-
-    /**
-     * Get a CSR value by address
-     * @param csr_addr CSR address (e.g., 0x300 for mstatus)
-     * @return CSR value, or 0 if not found/accessible
-     */
-    uint64_t get_csr(uint64_t csr_addr) const;
-
-    /**
-     * Get all accessible CSR values
-     * @return Map of CSR address -> value
-     */
-    std::map<uint64_t, uint64_t> get_all_csrs() const;
+    //==========================================================================
+    // Engine Configuration Getters
+    //==========================================================================
 
     /**
      * Get mem_region start address
@@ -260,14 +168,6 @@ public:
      * @return Size of mem_region in bytes
      */
     size_t get_mem_region_size() const { return mem_region_size_; }
-
-    /**
-     * Read memory at specified address
-     * @param addr Memory address to read from
-     * @param size Number of bytes to read
-     * @return Vector of bytes read from memory
-     */
-    std::vector<uint8_t> read_mem(uint64_t addr, size_t size) const;
 
     /**
      * Get current instruction index
@@ -302,6 +202,36 @@ public:
      * @return Number of steps executed in trap handler
      */
     size_t get_last_trap_handler_steps() const { return last_trap_handler_steps_; }
+
+    //==========================================================================
+    // Modular Component Accessors
+    //==========================================================================
+
+    /**
+     * Get the StateQuery interface for all processor state queries
+     *
+     * StateQuery provides comprehensive CPU state query interfaces:
+     * - Basic registers: get_xpr(), get_fpr(), get_pc(), get_all_xpr(), get_all_fpr()
+     * - CSRs: get_csr(), get_all_csrs()
+     * - Memory: read_mem()
+     * - Commit log: get_commit_log()
+     * - Privilege: get_privilege_state()
+     * - Trap info: get_last_trap_info()
+     * - Vector: get_vector_state(), is_vector_enabled()
+     * - Reservation: get_reservation_state(), has_reservation(), clear_reservation()
+     * - Debug: get_debug_state()
+     *
+     * @return Pointer to StateQuery object (valid for lifetime of SpikeEngine)
+     */
+    StateQuery* get_state_query() { return state_query_.get(); }
+    const StateQuery* get_state_query() const { return state_query_.get(); }
+
+    /**
+     * Get the CheckpointManager for advanced checkpoint operations
+     * @return Pointer to CheckpointManager (valid for lifetime of SpikeEngine)
+     */
+    CheckpointManager* get_checkpoint_manager() { return checkpoint_manager_.get(); }
+    const CheckpointManager* get_checkpoint_manager() const { return checkpoint_manager_.get(); }
 
     /**
      * Detect instruction size from machine code (static utility)
@@ -351,8 +281,7 @@ private:
     // Execution state
     size_t current_instr_index_;
 
-    Checkpoint checkpoint_;
-    bool checkpoint_valid_;
+    Checkpoint checkpoint_;  // Single checkpoint for simple use case
     bool initialized_;
 
     // Error handling
@@ -361,6 +290,12 @@ private:
     // Trap detection (for logging)
     bool last_execution_trapped_;      // True if last instruction triggered a trap
     size_t last_trap_handler_steps_;   // Steps executed in trap handler (0 if no trap)
+
+    // State query interface (modular state access)
+    std::unique_ptr<StateQuery> state_query_;
+
+    // Checkpoint manager (modular checkpoint operations)
+    std::unique_ptr<CheckpointManager> checkpoint_manager_;
 
     // Internal helper methods
 
@@ -399,15 +334,6 @@ private:
      */
     bool step_processor();
 
-    /**
-     * Save processor state to checkpoint
-     */
-    void save_state(Checkpoint& checkpoint);
-
-    /**
-     * Restore processor state from checkpoint
-     */
-    void restore_state(const Checkpoint& checkpoint);
 };
 
 } // namespace spike_engine
