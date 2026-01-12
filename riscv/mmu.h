@@ -396,6 +396,30 @@ public:
     return target_big_endian? target_endian<T>::to_be(n) : target_endian<T>::to_le(n);
   }
 
+  //==========================================================================
+  // Load Reservation State Access (for DiveFuzz state query)
+  //==========================================================================
+
+  /**
+   * Get the current load reservation address.
+   * Returns (reg_t)-1 if no reservation is active.
+   * @return Reserved physical address or -1 if invalid
+   */
+  inline reg_t get_load_reservation_address() const
+  {
+    return load_reservation_address;
+  }
+
+  /**
+   * Set the load reservation address (for checkpoint restore).
+   * Use (reg_t)-1 to invalidate the reservation.
+   * @param addr Physical address to reserve, or -1 to invalidate
+   */
+  inline void set_load_reservation_address(reg_t addr)
+  {
+    load_reservation_address = addr;
+  }
+
 private:
   simif_t* sim;
   processor_t* proc;

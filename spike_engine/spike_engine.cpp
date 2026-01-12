@@ -1,4 +1,6 @@
 #include "spike_engine.h"
+#include "state_query.h"
+#include "checkpoint.h"
 #include "../riscv/sim.h"
 #include "../riscv/processor.h"
 #include "../riscv/mmu.h"
@@ -8,6 +10,7 @@
 #include "../riscv/trap.h"
 #include "../riscv/encoding.h"
 #include "../riscv/triggers.h"      // For triggers::matched_t
+#include "../riscv/vector_unit.h"
 
 #include <stdexcept>
 #include <iostream>
@@ -19,23 +22,6 @@
 #include <cxxabi.h> // For abi::__cxa_current_exception_type
 
 namespace spike_engine {
-
-//==============================================================================
-// Checkpoint Implementation
-//==============================================================================
-
-Checkpoint::Checkpoint()
-    : xpr(32, 0)
-    , fpr(32, 0)
-    , fpr_v1(32, 0)  // FPR v[1] field for complete freg_t restoration
-    , pc(0)
-    , instr_index(0)
-    , next_instruction_addr(0)
-    , prv(3)  // Default to M-mode
-    , v(false)
-    , debug_mode(false)
-{
-}
 
 //==============================================================================
 // SpikeEngine Implementation
@@ -56,7 +42,6 @@ SpikeEngine::SpikeEngine(const std::string& elf_path,
     , mem_region_start_(0)
     , mem_region_size_(0)
     , current_instr_index_(0)
-    , checkpoint_valid_(false)
     , initialized_(false)
     , last_execution_trapped_(false)
     , last_trap_handler_steps_(0)
@@ -265,6 +250,13 @@ bool SpikeEngine::initialize() {
             }
         }
 
+        // Initialize state query interface
+        state_query_ = std::make_unique<StateQuery>(proc_, sim_.get());
+
+        // Initialize checkpoint manager
+        checkpoint_manager_ = std::make_unique<CheckpointManager>(proc_, sim_.get());
+        checkpoint_manager_->set_memory_region(mem_region_start_, mem_region_size_);
+
         initialized_ = true;
         return true;
 
@@ -359,15 +351,20 @@ bool SpikeEngine::find_nop_region() {
 }
 
 void SpikeEngine::set_checkpoint() {
-    save_state(checkpoint_);
-    checkpoint_valid_ = true;
+    if (!checkpoint_manager_) {
+        throw std::runtime_error("CheckpointManager not initialized");
+    }
+    checkpoint_manager_->save(checkpoint_, current_instr_index_, next_instruction_addr_);
 }
 
 void SpikeEngine::restore_checkpoint() {
-    if (!checkpoint_valid_) {
+    if (!checkpoint_manager_) {
+        throw std::runtime_error("CheckpointManager not initialized");
+    }
+    if (!checkpoint_.is_valid()) {
         throw std::runtime_error("No valid checkpoint to restore");
     }
-    restore_state(checkpoint_);
+    checkpoint_manager_->restore(checkpoint_, current_instr_index_, next_instruction_addr_);
 }
 
 size_t SpikeEngine::execute_sequence(
@@ -397,10 +394,11 @@ size_t SpikeEngine::execute_sequence(
     }
 
     // Verify PC matches next instruction address
-    if (get_pc() != next_instruction_addr_) {
+    uint64_t current_pc = proc_->get_state()->pc;
+    if (current_pc != next_instruction_addr_) {
         std::ostringstream oss;
         oss << "PC mismatch: expected 0x" << std::hex << next_instruction_addr_
-            << " but got 0x" << get_pc() << std::dec;
+            << " but got 0x" << current_pc << std::dec;
         throw std::runtime_error(oss.str());
     }
 
@@ -420,7 +418,7 @@ size_t SpikeEngine::execute_sequence(
     // - Forward jumps: PC jumps directly to target
     // - Backward loops: PC loops until branch falls through to target_pc
     size_t steps = 0;
-    while (get_pc() != target_pc && steps < max_steps) {
+    while (proc_->get_state()->pc != target_pc && steps < max_steps) {
         try {
             proc_->step(1);
         } catch (wait_for_interrupt_t&) {
@@ -432,7 +430,7 @@ size_t SpikeEngine::execute_sequence(
     if (steps >= max_steps) {
         std::ostringstream oss;
         oss << "Execution exceeded max_steps (" << max_steps << "), PC=0x"
-            << std::hex << get_pc() << ", target_pc=0x" << target_pc;
+            << std::hex << proc_->get_state()->pc << ", target_pc=0x" << target_pc;
         throw std::runtime_error(oss.str());
     }
 
@@ -451,102 +449,6 @@ size_t SpikeEngine::execute_sequence(
     }
 
     return machine_codes.size();
-}
-
-uint64_t SpikeEngine::get_xpr(int reg_index) const {
-    if (!proc_ || reg_index < 0 || reg_index >= 32) {
-        return 0;
-    }
-    return proc_->get_state()->XPR[reg_index];
-}
-
-uint64_t SpikeEngine::get_fpr(int reg_index) const {
-    if (!proc_ || reg_index < 0 || reg_index >= 32) {
-        return 0;
-    }
-    return proc_->get_state()->FPR[reg_index].v[0];
-}
-
-uint64_t SpikeEngine::get_pc() const {
-    if (!proc_) {
-        return 0;
-    }
-    return proc_->get_state()->pc;
-}
-
-std::vector<uint64_t> SpikeEngine::get_all_xpr() const {
-    std::vector<uint64_t> result(32, 0);
-    if (!proc_) {
-        return result;
-    }
-    for (int i = 0; i < 32; ++i) {
-        result[i] = proc_->get_state()->XPR[i];
-    }
-    return result;
-}
-
-std::vector<uint64_t> SpikeEngine::get_all_fpr() const {
-    std::vector<uint64_t> result(32, 0);
-    if (!proc_) {
-        return result;
-    }
-    for (int i = 0; i < 32; ++i) {
-        result[i] = proc_->get_state()->FPR[i].v[0];
-    }
-    return result;
-}
-
-uint64_t SpikeEngine::get_csr(uint64_t csr_addr) const {
-    if (!proc_) {
-        return 0;
-    }
-    try {
-        auto state = proc_->get_state();
-        auto it = state->csrmap.find(csr_addr);
-        if (it != state->csrmap.end() && it->second) {
-            return it->second->read();
-        }
-    } catch (...) {
-        // CSR read may throw exception, return 0
-    }
-    return 0;
-}
-
-std::map<uint64_t, uint64_t> SpikeEngine::get_all_csrs() const {
-    std::map<uint64_t, uint64_t> result;
-    if (!proc_) {
-        return result;
-    }
-    try {
-        auto state = proc_->get_state();
-        for (const auto& [addr, csr] : state->csrmap) {
-            if (csr) {
-                try {
-                    result[addr] = csr->read();
-                } catch (...) {
-                    // Skip CSRs that throw on read
-                }
-            }
-        }
-    } catch (...) {
-        // Return partial result on error
-    }
-    return result;
-}
-
-std::vector<uint8_t> SpikeEngine::read_mem(uint64_t addr, size_t size) const {
-    std::vector<uint8_t> result(size, 0);
-    if (!sim_ || !sim_->debug_mmu) {
-        return result;
-    }
-    try {
-        for (size_t i = 0; i < size; ++i) {
-            result[i] = sim_->debug_mmu->load<uint8_t>(addr + i);
-        }
-    } catch (...) {
-        // Return partial result on error
-    }
-    return result;
 }
 
 //==============================================================================
@@ -676,437 +578,6 @@ bool SpikeEngine::step_processor() {
 
         last_error_ = oss.str();
         return false;
-    }
-}
-
-void SpikeEngine::save_state(Checkpoint& checkpoint) {
-    if (!proc_) {
-        throw std::runtime_error("No processor to save state from");
-    }
-
-    try {
-        auto state = proc_->get_state();
-
-        // Save general-purpose registers
-        try {
-            for (int i = 0; i < 32; ++i) {
-                checkpoint.xpr[i] = state->XPR[i];
-            }
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("Failed to save XPR registers: ") + e.what());
-        } catch (...) {
-            throw std::runtime_error("Failed to save XPR registers: Unknown exception");
-        }
-
-        // Save floating-point registers (both v[0] and v[1] for complete freg_t state)
-        // v[1] is essential for correct NaN-boxing behavior in some edge cases
-        try {
-            for (int i = 0; i < 32; ++i) {
-                checkpoint.fpr[i] = state->FPR[i].v[0];
-                checkpoint.fpr_v1[i] = state->FPR[i].v[1];
-            }
-        } catch (const std::exception& e) {
-            throw std::runtime_error(std::string("Failed to save FPR registers: ") + e.what());
-        } catch (...) {
-            throw std::runtime_error("Failed to save FPR registers: Unknown exception");
-        }
-
-        // Save program counter
-        checkpoint.pc = state->pc;
-
-        // Save instruction index
-        // This marks the execution position at checkpoint time
-        checkpoint.instr_index = current_instr_index_;
-
-        // Save next instruction address
-        // This ensures PC and instruction placement remain synchronized after restore
-        checkpoint.next_instruction_addr = next_instruction_addr_;
-
-        // Save privilege and mode state
-        // These are essential for correct trap handling after restore
-        checkpoint.prv = state->prv;
-        checkpoint.v = state->v;
-        checkpoint.debug_mode = state->debug_mode;
-
-        // Save ALL CSRs by iterating through csrmap
-        // This ensures complete state restoration including all trap handling,
-        // interrupt, PMP, floating-point, and custom CSRs
-        checkpoint.csr_values.clear();
-
-        // Iterate through all CSRs in the csrmap and save their values
-        // Use try-catch for each CSR since some may throw exceptions on read
-        for (const auto& [addr, csr] : state->csrmap) {
-            if (csr) {
-                try {
-                    checkpoint.csr_values[addr] = csr->read();
-                } catch (...) {
-                    // Skip CSRs that throw exceptions on read
-                }
-            }
-        }
-
-        // Save memory region
-        if (mem_region_size_ > 0 && mem_region_start_ != 0) {
-            checkpoint.mem_region_backup.resize(mem_region_size_);
-            for (size_t i = 0; i < mem_region_size_; i += 8) {
-                uint64_t addr = mem_region_start_ + i;
-                uint64_t value = 0;
-                // Read 8 bytes at a time
-                for (size_t j = 0; j < 8 && (i + j) < mem_region_size_; ++j) {
-                    uint8_t byte = sim_->debug_mmu->load<uint8_t>(addr + j);
-                    value |= (static_cast<uint64_t>(byte) << (j * 8));
-                }
-                // Store in backup
-                for (size_t j = 0; j < 8 && (i + j) < mem_region_size_; ++j) {
-                    checkpoint.mem_region_backup[i + j] = (value >> (j * 8)) & 0xFF;
-                }
-            }
-        }
-
-    } catch (const std::runtime_error&) {
-        // Re-throw RuntimeError as-is (already has detailed message)
-        throw;
-    } catch (const std::exception& e) {
-        throw std::runtime_error(std::string("Failed to save checkpoint: ") + e.what());
-    } catch (...) {
-        throw std::runtime_error("Failed to save checkpoint: Unknown exception in outer block");
-    }
-}
-
-void SpikeEngine::restore_state(const Checkpoint& checkpoint) {
-    if (!proc_) {
-        throw std::runtime_error("No processor to restore state to");
-    }
-
-    try {
-        auto state = proc_->get_state();
-
-        // Restore privilege and mode state FIRST
-        // This is critical because CSR access permissions depend on privilege level
-        // If we restore CSRs before privilege level, some writes may fail
-        state->prv = checkpoint.prv;
-        state->v = checkpoint.v;
-        state->debug_mode = checkpoint.debug_mode;
-
-        // Restore CSRs from the saved map using direct pointer access
-        // We use the direct CSR pointers from state_t to avoid issues with
-        // some CSRs that may cause crashes when written via csrmap iteration
-        auto restore_csr = [&checkpoint](reg_t addr, const csr_t_p& csr) {
-            if (csr && checkpoint.csr_values.count(addr)) {
-                try {
-                    csr->write(checkpoint.csr_values.at(addr));
-                } catch (...) {
-                    // Silently skip CSRs that fail to write
-                }
-            }
-        };
-
-        // Machine mode trap handling CSRs
-        restore_csr(0x300, state->mstatus);
-        restore_csr(0x301, state->misa);
-        restore_csr(0x302, state->medeleg);
-        restore_csr(0x303, state->mideleg);
-        restore_csr(0x304, state->mie);
-        restore_csr(0x305, state->mtvec);
-        restore_csr(0x306, state->mcounteren);
-        restore_csr(0x310, state->mstatush);
-        restore_csr(0x320, state->mcountinhibit);
-        restore_csr(0x340, state->csrmap.count(0x340) ? state->csrmap.at(0x340) : nullptr);
-        restore_csr(0x341, state->mepc);
-        restore_csr(0x342, state->mcause);
-        restore_csr(0x343, state->mtval);
-        restore_csr(0x344, state->mip);
-
-        // Supervisor mode CSRs
-        restore_csr(0x100, state->sstatus);
-        restore_csr(0x104, state->nonvirtual_sie);
-        restore_csr(0x105, state->stvec);
-        restore_csr(0x106, state->scounteren);
-        restore_csr(0x140, state->csrmap.count(0x140) ? state->csrmap.at(0x140) : nullptr);
-        restore_csr(0x141, state->sepc);
-        restore_csr(0x142, state->scause);
-        restore_csr(0x143, state->stval);
-        restore_csr(0x144, state->nonvirtual_sip);
-        restore_csr(0x180, state->satp);
-
-        // Floating-point CSRs
-        // CRITICAL: Before restoring fflags/frm, we must temporarily enable mstatus.FS
-        // This is because float_csr_t::unlogged_write() calls dirty_fp_state which calls
-        // sstatus->dirty(). The dirty() function calls abort() if FS is disabled (FS==0).
-        //
-        // Strategy:
-        // 1. Temporarily set mstatus.FS to Dirty (0b11) to pass the enabled() check
-        // 2. Restore fflags and frm (this will trigger dirty_fp_state, but won't abort)
-        // 3. Restore the correct mstatus value at the end (see FINAL STATUS RESTORE section)
-        {
-            // Save current mstatus and set FS to Dirty (bits 13-14 = 0b11)
-            reg_t current_mstatus = state->mstatus->read();
-            reg_t temp_mstatus = (current_mstatus & ~MSTATUS_FS) | MSTATUS_FS;  // FS = Dirty (0b11)
-            state->mstatus->write(temp_mstatus);
-
-            // Now safe to restore floating-point CSRs
-            restore_csr(0x001, state->fflags);
-            restore_csr(0x002, state->frm);
-        }
-
-        // Vector extension CSRs
-        // CRITICAL: Similar to floating-point CSRs, vector CSRs call dirty_vs_state
-        // which will abort() if mstatus.VS == 0. We must temporarily enable VS.
-        //
-        // Strategy:
-        // 1. Temporarily set mstatus.VS to Dirty (0b11) to pass the enabled() check
-        // 2. Use write_raw() if available to bypass dirty_vs_state, otherwise use write()
-        // 3. mstatus will be re-restored at the end to override dirty bits
-        if (proc_->VU.VLEN > 0) {  // Only if V extension is enabled
-            reg_t current_mstatus = state->mstatus->read();
-            reg_t temp_mstatus = (current_mstatus & ~MSTATUS_VS) | MSTATUS_VS;  // VS = Dirty (0b11)
-            state->mstatus->write(temp_mstatus);
-
-            // Restore vector CSRs using write_raw() to bypass dirty_vs_state
-            // write_raw() directly writes without triggering dirty state check
-            if (proc_->VU.vstart && checkpoint.csr_values.count(CSR_VSTART)) {
-                proc_->VU.vstart->write_raw(checkpoint.csr_values.at(CSR_VSTART));
-            }
-            if (proc_->VU.vxrm && checkpoint.csr_values.count(CSR_VXRM)) {
-                proc_->VU.vxrm->write_raw(checkpoint.csr_values.at(CSR_VXRM));
-            }
-            if (proc_->VU.vl && checkpoint.csr_values.count(CSR_VL)) {
-                proc_->VU.vl->write_raw(checkpoint.csr_values.at(CSR_VL));
-            }
-            if (proc_->VU.vtype && checkpoint.csr_values.count(CSR_VTYPE)) {
-                proc_->VU.vtype->write_raw(checkpoint.csr_values.at(CSR_VTYPE));
-            }
-            // vxsat is vxsat_csr_t (not vector_csr_t), so it needs regular write with VS enabled
-            if (proc_->VU.vxsat && checkpoint.csr_values.count(CSR_VXSAT)) {
-                try {
-                    proc_->VU.vxsat->write(checkpoint.csr_values.at(CSR_VXSAT));
-                } catch (...) {
-                    // Silently skip if write fails
-                }
-            }
-        }
-
-        // Environment configuration CSRs
-        restore_csr(0x30A, state->menvcfg);
-        restore_csr(0x10A, state->senvcfg);
-
-        // Additional machine CSRs
-        restore_csr(0x323, state->csrmap.count(0x323) ? state->csrmap.at(0x323) : nullptr);
-        restore_csr(0x7A0, state->tselect);
-        restore_csr(0x7A2, state->tdata2);
-        restore_csr(0x7A5, state->tcontrol);
-
-        // Hypervisor CSRs (if H extension enabled)
-        restore_csr(0x600, state->hstatus);
-        restore_csr(0x602, state->hedeleg);
-        restore_csr(0x603, state->hideleg);
-        restore_csr(0x604, state->hvip);
-        restore_csr(0x605, state->htimedelta);  // htimedelta
-        restore_csr(0x606, state->hcounteren);
-        restore_csr(0x60A, state->henvcfg);     // henvcfg
-        restore_csr(0x643, state->htval);
-        restore_csr(0x64A, state->htinst);      // htinst
-        restore_csr(0x680, state->hgatp);
-
-        // Additional machine mode CSRs for H extension
-        restore_csr(0x34A, state->mtinst);      // mtinst
-        restore_csr(0x34B, state->mtval2);      // mtval2
-
-        // VS mode CSRs
-        restore_csr(0x200, state->vsstatus);
-        restore_csr(0x205, state->vstvec);
-        restore_csr(0x240, state->csrmap.count(0x240) ? state->csrmap.at(0x240) : nullptr);  // vsscratch
-        restore_csr(0x241, state->vsepc);
-        restore_csr(0x242, state->vscause);
-        restore_csr(0x243, state->vstval);
-        restore_csr(0x280, state->vsatp);
-
-        // Debug CSRs
-        restore_csr(0x7B0, state->dcsr);
-        restore_csr(0x7B1, state->dpc);
-        restore_csr(0x7B2, state->csrmap.count(0x7B2) ? state->csrmap.at(0x7B2) : nullptr);  // dscratch0
-        restore_csr(0x7B3, state->csrmap.count(0x7B3) ? state->csrmap.at(0x7B3) : nullptr);  // dscratch1
-
-        // Debug context CSRs
-        restore_csr(0x5A8, state->scontext);    // scontext
-        restore_csr(0x7A8, state->mcontext);    // mcontext
-
-        // Zcmt extension
-        restore_csr(0x017, state->jvt);         // jvt
-
-        // Zicfiss extension
-        restore_csr(0x011, state->ssp);         // ssp
-
-        // Security configuration
-        restore_csr(0x747, state->mseccfg);     // mseccfg
-
-        // AIA extension CSRs
-        restore_csr(0x308, state->mvien);       // mvien
-        restore_csr(0x309, state->mvip);        // mvip
-        restore_csr(0x609, state->hvictl);      // hvictl
-        restore_csr(0xEB0, state->vstopi);      // vstopi
-
-        // Sstc extension CSRs
-        restore_csr(0x14D, state->stimecmp);    // stimecmp
-        restore_csr(0x24D, state->vstimecmp);   // vstimecmp
-
-        // Smstateen extension CSRs
-        for (int i = 0; i < 4; ++i) {
-            restore_csr(0x30C + i, state->mstateen[i]);  // mstateen0-3
-            restore_csr(0x10C + i, state->sstateen[i]);  // sstateen0-3
-            restore_csr(0x60C + i, state->hstateen[i]);  // hstateen0-3
-        }
-
-        // CLIC/RNMI extension CSRs
-        restore_csr(0x741, state->mnepc);       // mnepc
-        restore_csr(0x744, state->mnstatus);    // mnstatus
-
-        // Supervisor count inhibit (Smcdeleg extension)
-        restore_csr(0x120, state->scountinhibit);  // scountinhibit
-
-        // Counter CSRs
-        // mcycle and minstret are wide_counter_csr_t with a 'written' flag
-        // that asserts on consecutive writes without an intervening bump().
-        // We call bump(0) first to reset the 'written' flag without incrementing.
-        if (state->mcycle) {
-            state->mcycle->bump(0);  // Reset 'written' flag
-            restore_csr(0xB00, state->mcycle);
-        }
-        if (state->minstret) {
-            state->minstret->bump(0);  // Reset 'written' flag
-            restore_csr(0xB02, state->minstret);
-        }
-
-        // PMP CSRs - restore pmpaddr registers
-        for (int i = 0; i < 64 && state->pmpaddr[i]; ++i) {
-            restore_csr(0x3B0 + i, state->pmpaddr[i]);  // pmpaddr0-63
-        }
-
-        // pmpcfg CSRs (0x3A0-0x3AF)
-        for (reg_t addr = 0x3A0; addr <= 0x3AF; ++addr) {
-            if (state->csrmap.count(addr)) {
-                restore_csr(addr, state->csrmap.at(addr));
-            }
-        }
-
-        // ========== UNRESTORABLE CSRs AND IMPACT ANALYSIS ==========
-        // The following CSRs are intentionally NOT restored due to hardware/software constraints.
-        // Analysis of impact on fuzzing instruction execution is provided for each category.
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 1. HARDWARE CONSTANT CSRs (Read-only, const_csr_t)                                  │
-        // │    - mvendorid (0xF11), marchid (0xF12), mimpid (0xF13)                             │
-        // │    - mhartid (0xF14), mconfigptr (0xF15)                                            │
-        // │                                                                                     │
-        // │    IMPACT: NONE - These are hardware constants that never change during execution. │
-        // │    FUZZ SAFE: YES - No effect on instruction behavior or state transitions.        │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 2. TIME-RELATED CSRs (Managed by CLINT/simulator, time_counter_csr_t)              │
-        // │    - time (0xC01): Timer value, updated by CLINT device                            │
-        // │    - timeh (0xC81): Upper 32 bits of time (RV32 only)                              │
-        // │                                                                                     │
-        // │    IMPACT: LOW - Time values are monotonically increasing and externally managed.  │
-        // │    FUZZ SAFE: YES - Fuzz tests typically don't rely on precise time values.        │
-        // │    NOTE: If testing time-dependent instructions (e.g., WFI with timer interrupts), │
-        // │          time CSR state may affect behavior.          │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 3. PERFORMANCE COUNTER PROXIES (Read-only aliases, derived from mcycle/minstret)   │
-        // │    - cycle (0xC00): User-mode alias for mcycle                                     │
-        // │    - instret (0xC02): User-mode alias for minstret                                 │
-        // │    - cycleh/instreth (0xC80/0xC82): Upper 32 bits (RV32)                           │
-        // │    - hpmcounter3-31 (0xC03-0xC1F): Hardware performance counters                   │
-        // │                                                                                     │
-        // │    IMPACT: NONE - These are read-only proxies; actual values come from mcycle/     │
-        // │            minstret which ARE restored above (with bump(0) special handling).      │
-        // │    FUZZ SAFE: YES - Cycle/instret values don't affect instruction semantics.       │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 4. VECTOR REGISTER FILE (Separate from CSRs)                                       │
-        // │    - 32 vector registers (v0-v31), each VLEN bits wide                             │
-        // │    - vlenb (0xC22): Read-only, equals VLEN/8                                       │
-        // │                                                                                     │
-        // │    IMPACT: MEDIUM - Vector register contents are NOT saved/restored currently.     │
-        // │    FUZZ SAFE: PARTIAL - If fuzzing vector instructions:                            │
-        // │      * Source operand values may differ after restore (affects result correctness) │
-        // │      * Destination register values persist (may cause false positive duplicates)   │
-        // │    RECOMMENDATION: For V-extension fuzzing, consider adding vector register        │
-        // │                    save/restore to Checkpoint structure.                           │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 5. CRYPTO EXTENSION CSRs (Side-effect on read)                                     │
-        // │    - seed (0x015): Entropy source for Zkr extension                                │
-        // │      * Read triggers wipe (returns random value, then clears internal state)       │
-        // │      * Write-only in practice; saved value is meaningless                          │
-        // │                                                                                     │
-        // │    IMPACT: LOW - Entropy source is non-deterministic by design.                    │
-        // │    FUZZ SAFE: YES - Random values don't affect instruction correctness testing.    │
-        // │    NOTE: If testing crypto instructions, results will be non-deterministic anyway. │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-        //
-        // ┌─────────────────────────────────────────────────────────────────────────────────────┐
-        // │ 6. INTERRUPT/EXCEPTION STATE (Complex state machine)                               │
-        // │    - Various *topi CSRs (mtopi, stopi, vstopi): Read-only interrupt priority       │
-        // │    - scountovf (0xDA0): Read-only counter overflow status                          │
-        // │                                                                                     │
-        // │    IMPACT: LOW - These reflect dynamic interrupt state, not persistent config.     │
-        // │    FUZZ SAFE: YES - Interrupt priority is recalculated from mip/mie/mideleg.       │
-        // └─────────────────────────────────────────────────────────────────────────────────────┘
-
-        // ========== FINAL STATUS RESTORE ==========
-        // Re-restore mstatus/sstatus AFTER floating-point CSRs to override dirty bits
-        // This is necessary because restoring fflags/frm triggers dirty_fp_state
-        // which sets mstatus.FS to dirty (0b11)
-        restore_csr(0x300, state->mstatus);
-        restore_csr(0x100, state->sstatus);
-
-        // Restore general-purpose registers
-        for (int i = 0; i < 32; ++i) {
-            state->XPR.write(i, checkpoint.xpr[i]);
-        }
-
-        // Restore floating-point registers (both v[0] and v[1] for complete freg_t state)
-        // Restoring v[1] is essential for correct NaN-boxing behavior
-        for (int i = 0; i < 32; ++i) {
-            freg_t freg_val;
-            freg_val.v[0] = checkpoint.fpr[i];
-            freg_val.v[1] = checkpoint.fpr_v1[i];  // Use saved v[1] instead of 0
-            state->FPR.write(i, freg_val);
-        }
-
-        // Restore program counter
-        state->pc = checkpoint.pc;
-
-        // Restore instruction index
-        current_instr_index_ = checkpoint.instr_index;
-
-        // Restore next instruction address
-        next_instruction_addr_ = checkpoint.next_instruction_addr;
-
-        // Restore memory region (essential for correct rollback of AMO/store instructions)
-        // Without this, rejected instructions' memory modifications would persist
-        if (!checkpoint.mem_region_backup.empty() && mem_region_size_ > 0) {
-            for (size_t i = 0; i < checkpoint.mem_region_backup.size(); ++i) {
-                sim_->debug_mmu->store<uint8_t>(mem_region_start_ + i, checkpoint.mem_region_backup[i]);
-            }
-        }
-
-        // CRITICAL: Flush TLB and instruction cache after restoring state.
-        // After restoring CSRs (mstatus, satp, pmp*, etc.), the TLB may contain
-        // stale entries that don't match the restored privilege/translation state.
-        // flush_tlb() clears all TLB entries and also calls flush_icache().
-        // This ensures consistent state for both instruction fetch and data access.
-        proc_->get_mmu()->flush_tlb();
-
-    } catch (const std::exception& e) {
-        throw std::runtime_error(std::string("Failed to restore checkpoint: ") + e.what());
-    } catch (...) {
-        throw std::runtime_error("Failed to restore checkpoint: Unknown exception");
     }
 }
 

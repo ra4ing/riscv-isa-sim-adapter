@@ -58,10 +58,14 @@ SYS_LIBS = -lpthread -ldl -lboost_regex -lboost_system
 
 # Source files
 ENGINE_SOURCES = spike_engine.cpp
+STATE_QUERY_SOURCES = state_query.cpp
+CHECKPOINT_SOURCES = checkpoint.cpp
 BINDING_SOURCES = bindings.cpp
 
 # Object files
 ENGINE_OBJECTS = $(ENGINE_SOURCES:.cpp=.o)
+STATE_QUERY_OBJECTS = $(STATE_QUERY_SOURCES:.cpp=.o)
+CHECKPOINT_OBJECTS = $(CHECKPOINT_SOURCES:.cpp=.o)
 BINDING_OBJECTS = $(BINDING_SOURCES:.cpp=.o)
 
 # Target files
@@ -105,17 +109,27 @@ check-deps:
 	@echo "Pybind11 include: $(PYBIND11_INCLUDE)"
 
 # Build engine object
-$(ENGINE_OBJECTS): $(ENGINE_SOURCES) spike_engine.h
+$(ENGINE_OBJECTS): $(ENGINE_SOURCES) spike_engine.h state_query.h checkpoint.h
 	@echo "Compiling spike_engine..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) $(PYTHON_INCLUDES) -c $< -o $@
 
+# Build state query object (depends on checkpoint.h for ReservationState)
+$(STATE_QUERY_OBJECTS): $(STATE_QUERY_SOURCES) state_query.h checkpoint.h
+	@echo "Compiling state_query..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(PYTHON_INCLUDES) -c $< -o $@
+
+# Build checkpoint object
+$(CHECKPOINT_OBJECTS): $(CHECKPOINT_SOURCES) checkpoint.h
+	@echo "Compiling checkpoint..."
+	$(CXX) $(CXXFLAGS) $(INCLUDES) $(PYTHON_INCLUDES) -c $< -o $@
+
 # Build Python binding object
-$(BINDING_OBJECTS): $(BINDING_SOURCES) spike_engine.h
+$(BINDING_OBJECTS): $(BINDING_SOURCES) spike_engine.h state_query.h checkpoint.h
 	@echo "Compiling Python bindings..."
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -I$(PYBIND11_INCLUDE) $(PYTHON_INCLUDES) -c $< -o $@
 
 # Build Python module
-$(PYTHON_MODULE): $(ENGINE_OBJECTS) $(BINDING_OBJECTS)
+$(PYTHON_MODULE): $(ENGINE_OBJECTS) $(STATE_QUERY_OBJECTS) $(CHECKPOINT_OBJECTS) $(BINDING_OBJECTS)
 	@echo "Linking Python module..."
 	$(CXX) -shared $(PYTHON_LDFLAGS) -o $@ $^ $(SPIKE_LIBS) $(SYS_LIBS)
 	@echo ""
