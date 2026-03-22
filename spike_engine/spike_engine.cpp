@@ -384,6 +384,10 @@ size_t SpikeEngine::execute_sequence(
         return 0;
     }
 
+    // CRITICAL: Set checkpoint at function entry BEFORE any state changes
+    // This ensures next_instruction_addr_ can be restored even if execution fails
+    set_checkpoint();
+
     // Calculate target PC (address after the last instruction)
     size_t total_size = std::accumulate(sizes.begin(), sizes.end(), size_t(0));
     uint64_t target_pc = next_instruction_addr_ + total_size;
