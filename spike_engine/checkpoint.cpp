@@ -31,10 +31,24 @@ Checkpoint::Checkpoint()
     , debug_mode(false)
     , prev_prv(3)
     , prev_v(false)
+    , vector_setvl_count(0)
+    , vector_vlmax(0)
+    , vector_vlenb(0)
+    , vector_vma(0)
+    , vector_vta(0)
+    , vector_vsew(0)
+    , vector_vflmul(0)
+    , vector_altfmt(0)
+    , vector_elen(0)
+    , vector_vlen(0)
+    , vector_vill(false)
+    , vector_vstart_alu(false)
     , serialized(true)
     , elp(0)
     , single_step(0)
     , critical_error(false)
+    , last_execution_trapped(false)
+    , last_trap_handler_steps(0)
     , valid(false)
     , timestamp(0)
     , id(0)
@@ -61,8 +75,22 @@ void Checkpoint::clear() {
     elp = 0;
     single_step = 0;
     critical_error = false;
+    last_execution_trapped = false;
+    last_trap_handler_steps = 0;
     valid = false;
     timestamp = 0;
+    vector_setvl_count = 0;
+    vector_vlmax = 0;
+    vector_vlenb = 0;
+    vector_vma = 0;
+    vector_vta = 0;
+    vector_vsew = 0;
+    vector_vflmul = 0;
+    vector_altfmt = 0;
+    vector_elen = 0;
+    vector_vlen = 0;
+    vector_vill = false;
+    vector_vstart_alu = false;
 }
 
 size_t Checkpoint::memory_usage() const {
@@ -471,6 +499,19 @@ void CheckpointManager::save_extended_state(Checkpoint& checkpoint) {
         size_t vreg_size = 32 * (proc_->VU.VLEN / 8);
         checkpoint.vector_regfile.resize(vreg_size);
         std::memcpy(checkpoint.vector_regfile.data(), proc_->VU.reg_file, vreg_size);
+
+        checkpoint.vector_setvl_count = proc_->VU.setvl_count;
+        checkpoint.vector_vlmax = proc_->VU.vlmax;
+        checkpoint.vector_vlenb = proc_->VU.vlenb;
+        checkpoint.vector_vma = proc_->VU.vma;
+        checkpoint.vector_vta = proc_->VU.vta;
+        checkpoint.vector_vsew = proc_->VU.vsew;
+        checkpoint.vector_vflmul = proc_->VU.vflmul;
+        checkpoint.vector_altfmt = proc_->VU.altfmt;
+        checkpoint.vector_elen = proc_->VU.ELEN;
+        checkpoint.vector_vlen = proc_->VU.VLEN;
+        checkpoint.vector_vill = proc_->VU.vill;
+        checkpoint.vector_vstart_alu = proc_->VU.vstart_alu;
     }
 }
 
@@ -513,6 +554,19 @@ void CheckpointManager::restore_extended_state(const Checkpoint& checkpoint) {
         if (checkpoint.vector_regfile.size() == vreg_size) {
             std::memcpy(proc_->VU.reg_file, checkpoint.vector_regfile.data(), vreg_size);
         }
+
+        proc_->VU.setvl_count = checkpoint.vector_setvl_count;
+        proc_->VU.vlmax = checkpoint.vector_vlmax;
+        proc_->VU.vlenb = checkpoint.vector_vlenb;
+        proc_->VU.vma = checkpoint.vector_vma;
+        proc_->VU.vta = checkpoint.vector_vta;
+        proc_->VU.vsew = checkpoint.vector_vsew;
+        proc_->VU.vflmul = checkpoint.vector_vflmul;
+        proc_->VU.altfmt = checkpoint.vector_altfmt;
+        proc_->VU.ELEN = checkpoint.vector_elen;
+        proc_->VU.VLEN = checkpoint.vector_vlen;
+        proc_->VU.vill = checkpoint.vector_vill;
+        proc_->VU.vstart_alu = checkpoint.vector_vstart_alu;
     }
 }
 

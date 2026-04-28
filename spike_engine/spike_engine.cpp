@@ -355,6 +355,8 @@ void SpikeEngine::set_checkpoint() {
         throw std::runtime_error("CheckpointManager not initialized");
     }
     checkpoint_manager_->save(checkpoint_, current_instr_index_, next_instruction_addr_);
+    checkpoint_.last_execution_trapped = last_execution_trapped_;
+    checkpoint_.last_trap_handler_steps = last_trap_handler_steps_;
 }
 
 void SpikeEngine::restore_checkpoint() {
@@ -365,6 +367,8 @@ void SpikeEngine::restore_checkpoint() {
         throw std::runtime_error("No valid checkpoint to restore");
     }
     checkpoint_manager_->restore(checkpoint_, current_instr_index_, next_instruction_addr_);
+    last_execution_trapped_ = checkpoint_.last_execution_trapped;
+    last_trap_handler_steps_ = checkpoint_.last_trap_handler_steps;
 }
 
 size_t SpikeEngine::execute_sequence(

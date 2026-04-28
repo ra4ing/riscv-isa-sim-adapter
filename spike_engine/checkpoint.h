@@ -128,6 +128,20 @@ struct Checkpoint {
     // Vector register file (if V extension enabled)
     std::vector<uint8_t> vector_regfile;
 
+    // Vector unit derived state/cache fields (if V extension enabled)
+    int vector_setvl_count;
+    uint64_t vector_vlmax;
+    uint64_t vector_vlenb;
+    uint64_t vector_vma;
+    uint64_t vector_vta;
+    uint64_t vector_vsew;
+    float vector_vflmul;
+    uint64_t vector_altfmt;
+    uint64_t vector_elen;
+    uint64_t vector_vlen;
+    bool vector_vill;
+    bool vector_vstart_alu;
+
     // Timer CSRs serialization flag
     bool serialized;
 
@@ -141,6 +155,10 @@ struct Checkpoint {
 
     // Critical error flag
     bool critical_error;
+
+    // Engine-level trap metadata from the previous execution
+    bool last_execution_trapped;
+    size_t last_trap_handler_steps;
 
     //==========================================================================
     // Metadata
