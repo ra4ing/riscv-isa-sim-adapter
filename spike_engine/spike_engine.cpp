@@ -41,10 +41,14 @@ SpikeEngine::SpikeEngine(const std::string& elf_path,
     , next_instruction_addr_(0)
     , mem_region_start_(0)
     , mem_region_size_(0)
+    , stack_region_start_(0)
+    , stack_region_size_(0)
     , current_instr_index_(0)
     , initialized_(false)
     , last_execution_trapped_(false)
     , last_trap_handler_steps_(0)
+    , checkpoint_save_count_(0)
+    , checkpoint_restore_count_(0)
 {
 }
 
@@ -256,6 +260,7 @@ bool SpikeEngine::initialize() {
         // Initialize checkpoint manager
         checkpoint_manager_ = std::make_unique<CheckpointManager>(proc_, sim_.get());
         checkpoint_manager_->set_memory_region(mem_region_start_, mem_region_size_);
+        checkpoint_manager_->set_stack_region(stack_region_start_, stack_region_size_);
 
         initialized_ = true;
         return true;
@@ -347,6 +352,25 @@ bool SpikeEngine::find_nop_region() {
         }
     }
 
+    // Find stack_region for checkpoint memory backup
+    // This is used by compressed SP memory instructions (c.lwsp, c.swsp, etc.)
+    uint64_t stack_region_addr = read_symbol_address("stack_region");
+    uint64_t stack_region_end_addr = read_symbol_address("stack_region_end");
+
+    if (stack_region_addr != 0 && stack_region_end_addr != 0) {
+        stack_region_start_ = stack_region_addr;
+        stack_region_size_ = stack_region_end_addr - stack_region_addr;
+        if (verbose_) {
+            std::cout << "[SpikeEngine] stack_region: 0x" << std::hex << stack_region_start_
+                      << " - 0x" << (stack_region_start_ + stack_region_size_)
+                      << " (size: " << std::dec << stack_region_size_ << " bytes)" << std::endl;
+        }
+    } else {
+        if (verbose_) {
+            std::cout << "[SpikeEngine] stack_region symbols not found" << std::endl;
+        }
+    }
+
     return true;
 }
 
@@ -357,6 +381,10 @@ void SpikeEngine::set_checkpoint() {
     checkpoint_manager_->save(checkpoint_, current_instr_index_, next_instruction_addr_);
     checkpoint_.last_execution_trapped = last_execution_trapped_;
     checkpoint_.last_trap_handler_steps = last_trap_handler_steps_;
+    checkpoint_save_count_++;
+    last_checkpoint_stats_ = checkpoint_.component_usage();
+    last_checkpoint_stats_["save_count"] = checkpoint_save_count_;
+    last_checkpoint_stats_["restore_count"] = checkpoint_restore_count_;
 }
 
 void SpikeEngine::restore_checkpoint() {
@@ -369,6 +397,16 @@ void SpikeEngine::restore_checkpoint() {
     checkpoint_manager_->restore(checkpoint_, current_instr_index_, next_instruction_addr_);
     last_execution_trapped_ = checkpoint_.last_execution_trapped;
     last_trap_handler_steps_ = checkpoint_.last_trap_handler_steps;
+    checkpoint_restore_count_++;
+    last_checkpoint_stats_["save_count"] = checkpoint_save_count_;
+    last_checkpoint_stats_["restore_count"] = checkpoint_restore_count_;
+}
+
+std::map<std::string, uint64_t> SpikeEngine::get_checkpoint_stats() const {
+    std::map<std::string, uint64_t> stats = last_checkpoint_stats_;
+    stats["save_count"] = checkpoint_save_count_;
+    stats["restore_count"] = checkpoint_restore_count_;
+    return stats;
 }
 
 size_t SpikeEngine::execute_sequence(

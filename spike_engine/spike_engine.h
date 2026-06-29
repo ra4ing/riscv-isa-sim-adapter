@@ -170,6 +170,18 @@ public:
     size_t get_mem_region_size() const { return mem_region_size_; }
 
     /**
+     * Get stack_region start address
+     * @return Start address of stack_region (for compressed SP memory operations)
+     */
+    uint64_t get_stack_region_start() const { return stack_region_start_; }
+
+    /**
+     * Get stack_region size
+     * @return Size of stack_region in bytes
+     */
+    size_t get_stack_region_size() const { return stack_region_size_; }
+
+    /**
      * Get current instruction index
      * @return Index of next instruction to replace
      */
@@ -202,6 +214,12 @@ public:
      * @return Number of steps executed in trap handler
      */
     size_t get_last_trap_handler_steps() const { return last_trap_handler_steps_; }
+
+    /**
+     * Get checkpoint memory/counter statistics from the engine.
+     * Values are byte counts unless the key ends in "_count".
+     */
+    std::map<std::string, uint64_t> get_checkpoint_stats() const;
 
     //==========================================================================
     // Modular Component Accessors
@@ -278,6 +296,10 @@ private:
     uint64_t mem_region_start_;
     size_t mem_region_size_;
 
+    // Stack region for checkpoint/restore (e.g., .stack_region section)
+    uint64_t stack_region_start_;
+    size_t stack_region_size_;
+
     // Execution state
     size_t current_instr_index_;
 
@@ -290,6 +312,11 @@ private:
     // Trap detection (for logging)
     bool last_execution_trapped_;      // True if last instruction triggered a trap
     size_t last_trap_handler_steps_;   // Steps executed in trap handler (0 if no trap)
+
+    // Checkpoint instrumentation for memory experiments
+    uint64_t checkpoint_save_count_;
+    uint64_t checkpoint_restore_count_;
+    std::map<std::string, uint64_t> last_checkpoint_stats_;
 
     // State query interface (modular state access)
     std::unique_ptr<StateQuery> state_query_;

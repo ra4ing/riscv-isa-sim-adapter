@@ -93,6 +93,10 @@ struct Checkpoint {
     // (e.g., AMO instructions, store instructions)
     std::vector<uint8_t> mem_region_backup;
 
+    // Stack region backup for checkpoint/restore
+    // Used by compressed SP memory instructions (c.lwsp, c.swsp, etc.)
+    std::vector<uint8_t> stack_region_backup;
+
     //==========================================================================
     // Privilege and Mode State
     //==========================================================================
@@ -197,6 +201,7 @@ struct Checkpoint {
      * Get approximate memory usage in bytes
      */
     size_t memory_usage() const;
+    std::map<std::string, uint64_t> component_usage() const;
 };
 
 //==============================================================================
@@ -226,6 +231,13 @@ public:
      * @param size Size of memory region in bytes
      */
     void set_memory_region(uint64_t start, size_t size);
+
+    /**
+     * Set stack region for backup
+     * @param start Start address of stack region
+     * @param size Size of stack region in bytes
+     */
+    void set_stack_region(uint64_t start, size_t size);
 
     //==========================================================================
     // Single Checkpoint Operations
@@ -305,6 +317,10 @@ private:
     // Memory region configuration
     uint64_t mem_region_start_;
     size_t mem_region_size_;
+
+    // Stack region configuration
+    uint64_t stack_region_start_;
+    size_t stack_region_size_;
 
     // Multi-checkpoint storage
     std::map<uint32_t, Checkpoint> checkpoints_;

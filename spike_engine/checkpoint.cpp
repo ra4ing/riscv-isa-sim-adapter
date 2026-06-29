@@ -63,6 +63,7 @@ void Checkpoint::clear() {
     instr_index = 0;
     next_instruction_addr = 0;
     mem_region_backup.clear();
+    stack_region_backup.clear();
     prv = 3;
     v = false;
     debug_mode = false;
@@ -99,8 +100,46 @@ size_t Checkpoint::memory_usage() const {
     usage += fpr.capacity() * sizeof(uint64_t);
     usage += fpr_v1.capacity() * sizeof(uint64_t);
     usage += mem_region_backup.capacity();
+    usage += stack_region_backup.capacity();
     usage += csr_values.size() * (sizeof(uint64_t) * 2 + 32);  // Approximate map overhead
     usage += vector_regfile.capacity();
+    return usage;
+}
+
+std::map<std::string, uint64_t> Checkpoint::component_usage() const {
+    std::map<std::string, uint64_t> usage;
+    usage["total_bytes"] = static_cast<uint64_t>(memory_usage());
+    usage["gpr_bytes"] = static_cast<uint64_t>(xpr.capacity() * sizeof(uint64_t));
+    usage["fpr_bytes"] = static_cast<uint64_t>(
+        (fpr.capacity() + fpr_v1.capacity()) * sizeof(uint64_t)
+    );
+    usage["pc_bytes"] = static_cast<uint64_t>(sizeof(pc));
+    usage["execution_position_bytes"] = static_cast<uint64_t>(
+        sizeof(instr_index) + sizeof(next_instruction_addr)
+    );
+    usage["memory_region_bytes"] = static_cast<uint64_t>(mem_region_backup.capacity());
+    usage["stack_region_bytes"] = static_cast<uint64_t>(stack_region_backup.capacity());
+    usage["memory_snapshot_bytes"] = usage["memory_region_bytes"] + usage["stack_region_bytes"];
+    usage["csr_bytes"] = static_cast<uint64_t>(
+        csr_values.size() * (sizeof(uint64_t) * 2 + 32)
+    );
+    usage["csr_count"] = static_cast<uint64_t>(csr_values.size());
+    usage["reservation_bytes"] = static_cast<uint64_t>(sizeof(reservation));
+    usage["privilege_bytes"] = static_cast<uint64_t>(
+        sizeof(prv) + sizeof(v) + sizeof(debug_mode) + sizeof(prev_prv) + sizeof(prev_v)
+    );
+    usage["vector_regfile_bytes"] = static_cast<uint64_t>(vector_regfile.capacity());
+    usage["vector_metadata_bytes"] = static_cast<uint64_t>(
+        sizeof(vector_setvl_count) + sizeof(vector_vlmax) + sizeof(vector_vlenb)
+        + sizeof(vector_vma) + sizeof(vector_vta) + sizeof(vector_vsew)
+        + sizeof(vector_vflmul) + sizeof(vector_altfmt) + sizeof(vector_elen)
+        + sizeof(vector_vlen) + sizeof(vector_vill) + sizeof(vector_vstart_alu)
+    );
+    usage["vector_total_bytes"] = usage["vector_regfile_bytes"] + usage["vector_metadata_bytes"];
+    usage["debug_metadata_bytes"] = static_cast<uint64_t>(
+        sizeof(serialized) + sizeof(elp) + sizeof(single_step) + sizeof(critical_error)
+        + sizeof(last_execution_trapped) + sizeof(last_trap_handler_steps)
+    );
     return usage;
 }
 
@@ -113,6 +152,8 @@ CheckpointManager::CheckpointManager(processor_t* proc, sim_t* sim)
     , sim_(sim)
     , mem_region_start_(0)
     , mem_region_size_(0)
+    , stack_region_start_(0)
+    , stack_region_size_(0)
     , next_checkpoint_id_(1)
 {
 }
@@ -120,6 +161,11 @@ CheckpointManager::CheckpointManager(processor_t* proc, sim_t* sim)
 void CheckpointManager::set_memory_region(uint64_t start, size_t size) {
     mem_region_start_ = start;
     mem_region_size_ = size;
+}
+
+void CheckpointManager::set_stack_region(uint64_t start, size_t size) {
+    stack_region_start_ = start;
+    stack_region_size_ = size;
 }
 
 //==============================================================================
@@ -440,27 +486,46 @@ void CheckpointManager::restore_csrs(const Checkpoint& checkpoint) {
 }
 
 void CheckpointManager::save_memory(Checkpoint& checkpoint) {
-    if (mem_region_size_ == 0 || mem_region_start_ == 0 || !sim_) {
-        return;
+    if (!sim_) return;
+
+    // Save mem_region
+    if (mem_region_size_ > 0 && mem_region_start_ != 0) {
+        checkpoint.mem_region_backup.resize(mem_region_size_);
+        for (size_t i = 0; i < mem_region_size_; i += 8) {
+            uint64_t addr = mem_region_start_ + i;
+            for (size_t j = 0; j < 8 && (i + j) < mem_region_size_; ++j) {
+                checkpoint.mem_region_backup[i + j] = sim_->debug_mmu->load<uint8_t>(addr + j);
+            }
+        }
     }
 
-    checkpoint.mem_region_backup.resize(mem_region_size_);
-
-    for (size_t i = 0; i < mem_region_size_; i += 8) {
-        uint64_t addr = mem_region_start_ + i;
-        for (size_t j = 0; j < 8 && (i + j) < mem_region_size_; ++j) {
-            checkpoint.mem_region_backup[i + j] = sim_->debug_mmu->load<uint8_t>(addr + j);
+    // Save stack_region
+    if (stack_region_size_ > 0 && stack_region_start_ != 0) {
+        checkpoint.stack_region_backup.resize(stack_region_size_);
+        for (size_t i = 0; i < stack_region_size_; i += 8) {
+            uint64_t addr = stack_region_start_ + i;
+            for (size_t j = 0; j < 8 && (i + j) < stack_region_size_; ++j) {
+                checkpoint.stack_region_backup[i + j] = sim_->debug_mmu->load<uint8_t>(addr + j);
+            }
         }
     }
 }
 
 void CheckpointManager::restore_memory(const Checkpoint& checkpoint) {
-    if (checkpoint.mem_region_backup.empty() || mem_region_size_ == 0 || !sim_) {
-        return;
+    if (!sim_) return;
+
+    // Restore mem_region
+    if (!checkpoint.mem_region_backup.empty() && mem_region_size_ > 0) {
+        for (size_t i = 0; i < checkpoint.mem_region_backup.size(); ++i) {
+            sim_->debug_mmu->store<uint8_t>(mem_region_start_ + i, checkpoint.mem_region_backup[i]);
+        }
     }
 
-    for (size_t i = 0; i < checkpoint.mem_region_backup.size(); ++i) {
-        sim_->debug_mmu->store<uint8_t>(mem_region_start_ + i, checkpoint.mem_region_backup[i]);
+    // Restore stack_region
+    if (!checkpoint.stack_region_backup.empty() && stack_region_size_ > 0) {
+        for (size_t i = 0; i < checkpoint.stack_region_backup.size(); ++i) {
+            sim_->debug_mmu->store<uint8_t>(stack_region_start_ + i, checkpoint.stack_region_backup[i]);
+        }
     }
 }
 

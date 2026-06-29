@@ -334,6 +334,12 @@ PYBIND11_MODULE(spike_engine, m) {
         .def("get_mem_region_size", &SpikeEngine::get_mem_region_size,
              "Get mem_region size in bytes")
 
+        .def("get_stack_region_start", &SpikeEngine::get_stack_region_start,
+             "Get stack_region start address (for compressed SP memory operations)")
+
+        .def("get_stack_region_size", &SpikeEngine::get_stack_region_size,
+             "Get stack_region size in bytes")
+
         .def("get_current_index", &SpikeEngine::get_current_index,
              "Get current instruction index")
 
@@ -368,6 +374,9 @@ PYBIND11_MODULE(spike_engine, m) {
              Returns:
                  Number of steps executed in trap handler
              )pbdoc")
+
+        .def("get_checkpoint_stats", &SpikeEngine::get_checkpoint_stats,
+             "Get checkpoint save/restore counters and last checkpoint byte breakdown")
 
         //======================================================================
         // Modular Component Accessors
