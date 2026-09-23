@@ -125,6 +125,10 @@ struct Checkpoint {
     // Load reservation state (for LR/SC atomic operations)
     ReservationState reservation;
 
+    // PMP entries need raw restoration: ordinary CSR writes cannot clear L.
+    std::vector<uint64_t> pmp_addresses;
+    std::vector<uint8_t> pmp_configurations;
+
     // Privilege transition tracking
     uint64_t prev_prv;
     bool prev_v;

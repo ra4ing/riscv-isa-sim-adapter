@@ -109,6 +109,16 @@ class pmpaddr_csr_t: public csr_t {
     return cfg & PMP_L;
   }
 
+  // Checkpoint restoration must bypass the architectural lock rule.  These
+  // values were captured from the same processor before speculative execution;
+  // they are not guest CSR writes.  The checkpoint manager flushes the TLB.
+  reg_t checkpoint_value() const noexcept { return val; }
+  uint8_t checkpoint_config() const noexcept { return cfg; }
+  void restore_checkpoint_value(reg_t value, uint8_t config) noexcept {
+    val = value;
+    cfg = config;
+  }
+
  protected:
   virtual bool unlogged_write(const reg_t val) noexcept override;
  private:

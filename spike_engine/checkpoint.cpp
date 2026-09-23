@@ -69,6 +69,8 @@ void Checkpoint::clear() {
     debug_mode = false;
     csr_values.clear();
     reservation.clear();
+    pmp_addresses.clear();
+    pmp_configurations.clear();
     prev_prv = 3;
     prev_v = false;
     vector_regfile.clear();
@@ -103,6 +105,8 @@ size_t Checkpoint::memory_usage() const {
     usage += stack_region_backup.capacity();
     usage += csr_values.size() * (sizeof(uint64_t) * 2 + 32);  // Approximate map overhead
     usage += vector_regfile.capacity();
+    usage += pmp_addresses.capacity() * sizeof(uint64_t);
+    usage += pmp_configurations.capacity();
     return usage;
 }
 
@@ -125,6 +129,9 @@ std::map<std::string, uint64_t> Checkpoint::component_usage() const {
     );
     usage["csr_count"] = static_cast<uint64_t>(csr_values.size());
     usage["reservation_bytes"] = static_cast<uint64_t>(sizeof(reservation));
+    usage["pmp_bytes"] = static_cast<uint64_t>(
+        pmp_addresses.capacity() * sizeof(uint64_t) + pmp_configurations.capacity()
+    );
     usage["privilege_bytes"] = static_cast<uint64_t>(
         sizeof(prv) + sizeof(v) + sizeof(debug_mode) + sizeof(prev_prv) + sizeof(prev_v)
     );
@@ -543,6 +550,15 @@ void CheckpointManager::save_extended_state(Checkpoint& checkpoint) {
         checkpoint.reservation.valid = (checkpoint.reservation.address != ReservationState::INVALID_ADDR);
     }
 
+    // Save the internal PMP entries before a speculative CSR write can set L.
+    // pmpaddr.read() is not sufficient: its returned value is mode-masked.
+    checkpoint.pmp_addresses.resize(proc_->n_pmp);
+    checkpoint.pmp_configurations.resize(proc_->n_pmp);
+    for (size_t i = 0; i < proc_->n_pmp; ++i) {
+        checkpoint.pmp_addresses[i] = state->pmpaddr[i]->checkpoint_value();
+        checkpoint.pmp_configurations[i] = state->pmpaddr[i]->checkpoint_config();
+    }
+
     // Save privilege transition state
     checkpoint.prev_prv = state->prev_prv;
     checkpoint.prev_v = state->prev_v;
@@ -611,6 +627,18 @@ void CheckpointManager::restore_extended_state(const Checkpoint& checkpoint) {
         } else {
             mmu->yield_load_reservation();
         }
+    }
+
+    // CSR::write obeys PMP lock bits, so it cannot undo a speculative lock.
+    // Restore the captured internal state after restore_csrs attempted writes.
+    if (checkpoint.pmp_addresses.size() != proc_->n_pmp ||
+        checkpoint.pmp_configurations.size() != proc_->n_pmp) {
+        throw std::runtime_error("Checkpoint PMP entry count mismatch");
+    }
+    for (size_t i = 0; i < proc_->n_pmp; ++i) {
+        state->pmpaddr[i]->restore_checkpoint_value(
+            checkpoint.pmp_addresses[i], checkpoint.pmp_configurations[i]
+        );
     }
 
     // Restore vector register file if present
