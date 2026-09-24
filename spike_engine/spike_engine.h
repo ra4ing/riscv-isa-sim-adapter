@@ -8,6 +8,7 @@
 #include <vector>
 #include <memory>
 #include <cstdint>
+#include <tuple>
 #include <map>
 
 #include "state_query.h"
@@ -115,6 +116,15 @@ public:
      * Restore processor state from last checkpoint
      */
     void restore_checkpoint();
+
+    /**
+     * Named checkpoints (independent of the single candidate checkpoint slot).
+     * Used by the DIVEFUZZ_STATE_ACQUISITION=replay ablation to keep an
+     * "initial" snapshot alive across per-candidate set_checkpoint calls.
+     */
+    void save_named_checkpoint(const std::string& name);
+    void restore_named_checkpoint(const std::string& name);
+    bool has_named_checkpoint(const std::string& name) const;
 
     /**
      * Execute a sequence of instructions
@@ -304,6 +314,9 @@ private:
     size_t current_instr_index_;
 
     Checkpoint checkpoint_;  // Single checkpoint for simple use case
+    std::map<std::string, Checkpoint> named_checkpoints_;
+    // name -> (instr_index, next_instruction_addr, trapped, trap_handler_steps)
+    std::map<std::string, std::tuple<size_t, uint64_t, bool, size_t>> named_positions_;
     bool initialized_;
 
     // Error handling

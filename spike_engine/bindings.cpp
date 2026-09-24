@@ -287,6 +287,15 @@ PYBIND11_MODULE(spike_engine, m) {
              Returns True on success, False on error (check get_last_error())
              )pbdoc")
 
+        .def("save_named_checkpoint", &SpikeEngine::save_named_checkpoint,
+             py::arg("name"),
+             "Save current state into a named checkpoint slot")
+        .def("restore_named_checkpoint", &SpikeEngine::restore_named_checkpoint,
+             py::arg("name"),
+             "Restore state from a named checkpoint slot")
+        .def("has_named_checkpoint", &SpikeEngine::has_named_checkpoint,
+             py::arg("name"),
+             "Check whether a named checkpoint exists")
         .def("set_checkpoint", &SpikeEngine::set_checkpoint,
              "Save current processor state as checkpoint")
 

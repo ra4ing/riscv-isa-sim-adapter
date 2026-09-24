@@ -402,6 +402,41 @@ void SpikeEngine::restore_checkpoint() {
     last_checkpoint_stats_["restore_count"] = checkpoint_restore_count_;
 }
 
+void SpikeEngine::save_named_checkpoint(const std::string& name) {
+    if (!checkpoint_manager_) {
+        throw std::runtime_error("CheckpointManager not initialized");
+    }
+    Checkpoint& target = named_checkpoints_[name];
+    checkpoint_manager_->save(target, current_instr_index_, next_instruction_addr_);
+    target.last_execution_trapped = last_execution_trapped_;
+    target.last_trap_handler_steps = last_trap_handler_steps_;
+    named_positions_[name] = std::make_tuple(
+        current_instr_index_, next_instruction_addr_,
+        last_execution_trapped_, last_trap_handler_steps_);
+}
+
+void SpikeEngine::restore_named_checkpoint(const std::string& name) {
+    if (!checkpoint_manager_) {
+        throw std::runtime_error("CheckpointManager not initialized");
+    }
+    auto it = named_checkpoints_.find(name);
+    if (it == named_checkpoints_.end() || !it->second.is_valid()) {
+        throw std::runtime_error("No valid named checkpoint '" + name + "'");
+    }
+    const auto& pos = named_positions_.at(name);
+    checkpoint_manager_->restore(
+        it->second, current_instr_index_, next_instruction_addr_);
+    current_instr_index_ = std::get<0>(pos);
+    next_instruction_addr_ = std::get<1>(pos);
+    last_execution_trapped_ = std::get<2>(pos);
+    last_trap_handler_steps_ = std::get<3>(pos);
+}
+
+bool SpikeEngine::has_named_checkpoint(const std::string& name) const {
+    auto it = named_checkpoints_.find(name);
+    return it != named_checkpoints_.end() && it->second.is_valid();
+}
+
 std::map<std::string, uint64_t> SpikeEngine::get_checkpoint_stats() const {
     std::map<std::string, uint64_t> stats = last_checkpoint_stats_;
     stats["save_count"] = checkpoint_save_count_;
