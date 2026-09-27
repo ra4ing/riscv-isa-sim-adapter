@@ -15,6 +15,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <time.h>
+#include <sys/prctl.h>
 
 // Global error information storage
 static std::string g_last_error;
@@ -31,15 +32,15 @@ static double monotonic_now() {
     return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
 }
 
-// Execute cmd via /bin/sh with stdout+stderr captured, enforcing a wall-clock
-// timeout: on expiry the whole child process group (sh + spike) is SIGKILLed
-// and the query raises, which the caller already treats as a rejected
-// candidate. Fast queries are byte-for-byte identical to plain popen().
+// Run cmd via /bin/sh with stdout+stderr captured. The command must use
+// "exec spike": the shell is replaced by Spike, so PR_SET_PDEATHSIG reaches
+// the simulator if an executor terminates its worker during the query.
 static std::string run_with_timeout(const std::string& cmd, double timeout_sec) {
     int fds[2];
     if (pipe(fds) != 0)
         throw std::runtime_error("pipe() failed");
 
+    const pid_t worker_pid = getpid();
     pid_t pid = fork();
     if (pid < 0) {
         close(fds[0]);
@@ -47,7 +48,13 @@ static std::string run_with_timeout(const std::string& cmd, double timeout_sec) 
         throw std::runtime_error("fork() failed");
     }
     if (pid == 0) {
-        setpgid(0, 0); // own group so the timeout kills sh+spike together
+        // setpgid lets the normal query timeout kill this query alone.
+        // PR_SET_PDEATHSIG covers the other path: the generator's executor
+        // kills its worker before the query timeout handler can run.
+        if (setpgid(0, 0) != 0 ||
+            prctl(PR_SET_PDEATHSIG, SIGKILL) != 0 ||
+            getppid() != worker_pid)
+            _exit(127);
         close(fds[0]);
         dup2(fds[1], STDOUT_FILENO);
         dup2(fds[1], STDERR_FILENO);
@@ -98,16 +105,14 @@ static std::string run_with_timeout(const std::string& cmd, double timeout_sec) 
     return result;
 }
 
-// Run Spike debugging from a file path 
-// – use --debug-cmd-from-string to avoid creating temporary files for debug commands.
-// Run Spike debugging from a file path
-// – use --debug-cmd-from-string to avoid creating temporary files for debug commands.
+// Keep the original shell invocation overhead, but replace the shell with
+// Spike before running the query so worker death cannot orphan the simulator.
 static std::string run_spike_debug_cmd_str_elf_file(const std::string& elf_file_path,
                                            const std::string& debug_cmds_string,
                                            const std::string& isa_string) {
     char spike_cmd[4096];
     snprintf(spike_cmd, sizeof(spike_cmd),
-            "spike -d --isa=%s --debug-cmd-from-string='%s' %s 2>&1",
+            "exec spike -d --isa=%s --debug-cmd-from-string='%s' %s 2>&1",
             isa_string.c_str(), debug_cmds_string.c_str(), elf_file_path.c_str());
     return run_with_timeout(spike_cmd, kSpikeQueryTimeoutSec);
 }
@@ -117,7 +122,7 @@ static std::string run_spike_debug_cmd_file_elf_file(const std::string& elf_file
                                            const std::string& isa_string) {
     char spike_cmd[4096];
     snprintf(spike_cmd, sizeof(spike_cmd),
-            "spike -d --isa=%s --debug-cmd='%s' %s 2>&1",
+            "exec spike -d --isa=%s --debug-cmd='%s' %s 2>&1",
             isa_string.c_str(), debug_cmds_path.c_str(), elf_file_path.c_str());
     return run_with_timeout(spike_cmd, kSpikeQueryTimeoutSec);
 }
